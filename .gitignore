@@ -1,0 +1,76 @@
+# secrets
+.env
+.env.*
+!.env.example
+
+# python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# local sqlite (docker uses a named volume; local uvicorn writes backend/swarm.db)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+swarm-backup-*.db
+
+# os / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# frontend
+frontend/node_modules/
+frontend/dist/
+
+# local agent handoff context
+context.md
+.scratch/
+frontend/dist.zip
+# agent tooling installed locally. The bundled product skills in skills/*.md
+# (the /commands: standup, digest, plan, …) are tracked source — do not
+# blanket-ignore skills/.
+agent/skills/frontend-design/
+skills/frontend-design/
+skills-lock.json
+SKILL.md
+.claude/skills/
+.agents/skills/
+.antigravity/
+.agents/cache/
+
+# impeccable design tooling (local artifacts, not source)
+DESIGN.md
+.impeccable/surfaces/
+.impeccable/mocks/
+.impeccable/review/
+.impeccable/build/
+.impeccable/config.local.json
+
+# advisor plans are scratch output, not source
+advisor-plans/
+
+# logs & coverage
+*.log
+npm-debug.log*
+bun-debug.log*
+coverage/
+.pytest_cache/
+
+# os / editor cruft
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+*.local
+*.bak
+*.orig
+*.rej
+.cache/
+

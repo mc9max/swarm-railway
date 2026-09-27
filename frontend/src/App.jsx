@@ -1,0 +1,1327 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+// The API client lives in lib.js, which is its only owner.
+import { apiJson, CACHE_TTL, fmtBytes } from "./lib.js";
+import {
+  Avatar, Button, Input, Textarea, Card, ScrollArea, EmptyState, Divider, CodeBlock,
+} from "./ui.jsx";
+import { Sidebar } from "./components/Sidebar";
+import { TopBar } from "./components/TopBar";
+import { MessageList } from "./components/MessageList";
+import { Composer } from "./components/Composer";
+import { ComputerPanel } from "./components/ComputerPanel.jsx";
+import { CommandPalette } from "./components/CommandPalette";
+import { LoginScreen } from "./components/LoginScreen";
+import { CommandCenter } from "./components/CommandCenter.jsx";
+import { WorkHome, WorkDetail as WorkRunDetail } from "./components/WorkHome.jsx";
+import { ContextDrawer } from "./components/ContextDrawer.jsx";
+import { KnowledgeView } from "./components/KnowledgeView.jsx";
+import { WorkRail, WorkRailSheet, WorkDetail } from "./components/WorkRail.jsx";
+import { Flap, Lamp } from "./components/Flap";
+import { X, MessageSquare } from "lucide-react";
+import { useWorkSessions, cancelWork, WORK_ACTIVE } from "./work/sessionStore.js";
+
+// PANEL_GROUPS is owned by ComputerPanel.jsx. The copy that lived here was
+// dead and had drifted from it.
+
+export default function App() {
+  const [user, setUser] = useState(null);
+  const [token, setToken] = useState(null);
+  const [channel, setChannel] = useState("dm-swarm");
+  const [channels, setChannels] = useState([]);
+  const [agents, setAgents] = useState([]);
+  const [allAgents, setAllAgents] = useState([]);
+  const [teams, setTeams] = useState([]);
+  const [approvals, setApprovals] = useState([]);
+  const [computer, setComputer] = useState(null);
+  const [messages, setMessages] = useState({});
+  const [order, setOrder] = useState([]);
+  const [replyCounts, setReplyCounts] = useState({});
+  const [reactions, setReactions] = useState({});
+  const [hasMore, setHasMore] = useState(false);
+  const [loadingLog, setLoadingLog] = useState(false);
+  const [threadId, setThreadId] = useState(null);
+  const [threadParent, setThreadParent] = useState(null);
+  const [threadReplies, setThreadReplies] = useState([]);
+  const [wsStatus, setWsStatus] = useState("offline");
+  const [toast, setToast] = useState(null);
+  const [loginErr, setLoginErr] = useState("");
+  const [loginBusy, setLoginBusy] = useState(false);
+  const [demoMode, setDemoMode] = useState(false);
+  const [computerOpen, setComputerOpen] = useState(false);
+  const [panelTab, setPanelTab] = useState("files");
+  const [mainView, setMainView] = useState("talk");
+  const [cmdOpen, setCmdOpen] = useState(false);
+  const [typing, setTyping] = useState("");
+  const [meRole, setMeRole] = useState("member");
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [selectedRun, setSelectedRun] = useState(null);
+  const [quickAction, setQuickAction] = useState(null);
+  const [retryingId, setRetryingId] = useState(null);
+  const [sendFailure, setSendFailure] = useState(null);
+  const [contextStats, setContextStats] = useState(null);
+  const [contextError, setContextError] = useState(false);
+  const [workRailOpen, setWorkRailOpen] = useState(false);
+  const [showContext, setShowContext] = useState(false);
+  const [selectedWork, setSelectedWork] = useState(null);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [rosterFolded, setRosterFolded] = useState(
+    () => localStorage.getItem("swarm_roster_folded") === "1",
+  );
+  const [streamingAgents, setStreamingAgents] = useState({});
+  const [streamText, setStreamText] = useState({});
+  const [outbox, setOutbox] = useState(() => {
+    try { return JSON.parse(localStorage.getItem("swarm.outbox") || "{}"); } catch { return {}; }
+  });
+  const [chatModel, setChatModelState] = useState(() => {
+    try { return localStorage.getItem("swarm.chat_model") || ""; } catch { return ""; }
+  });
+  const [composerPrefill, setComposerPrefill] = useState("");
+
+  function setChatModel(value) {
+    setChatModelState(value || "");
+    try { localStorage.setItem("swarm.chat_model", value || ""); } catch { /* private mode */ }
+  }
+
+  const wsRef = useRef(null);
+  const wsGen = useRef(0);
+  const loadReq = useRef(0);
+  const toastTimer = useRef(null);
+  const lastSeenId = useRef({});
+  const reconnectAttempt = useRef(0);
+  const reconnectTimer = useRef(null);
+  const intentionalClose = useRef(false);
+  const tokenRef = useRef(token);
+  const channelRef = useRef(channel);
+  tokenRef.current = token; channelRef.current = channel;
+  const ingestWorkEventRef = useRef(null);
+  const handleChannelDeletedRef = useRef(null);
+
+  const current = channels.find(c => c.id === channel) || { id: channel, name: channel, topic: "" };
+  const bot = allAgents.find(a => a.dm_channel_id === channel);
+  const rooms = channels.filter(c => c.kind !== "dm" && c.kind !== "group" && c.kind !== "people");
+  const groups = channels.filter(c => c.kind === "group");
+  const peopleDms = channels.filter(c => c.kind === "people");
+  const roots = order.map(id => messages[id]).filter(Boolean);
+  const pendingHere = approvals.filter(a => a.status === "pending" && a.channel_id === channel);
+
+  const { sessions: workSessions, eventsByWork, connected: workConnected, error: workError, refresh: refreshWork, ingestWorkEvent } = useWorkSessions(token);
+  const activeWork = workSessions.filter(s => WORK_ACTIVE.has(s.status));
+  const workAttention = workSessions.filter(s => s.requires_action || s.status === "waiting_for_approval");
+  const activeWorkHere = activeWork.filter(s => !s.channel_id || s.channel_id === channel);
+  const workingWith = [...new Set(
+    activeWorkHere.flatMap(s => (eventsByWork[s.id] || []).map(e => e.payload?.agent).filter(Boolean))
+  )];
+  const chatBusy = !!typing || Object.keys(streamText).length > 0;
+  const workByMessage = {};
+  for (const s of workSessions) {
+    for (const e of eventsByWork[s.id] || []) {
+      if (e.type === "message_linked" && e.payload?.message_id) workByMessage[e.payload.message_id] = s;
+    }
+  }
+  ingestWorkEventRef.current = ingestWorkEvent;
+  handleChannelDeletedRef.current = handleChannelDeleted;
+
+  const flash = useCallback((msg, type = "info", title) => {
+    setToast({ msg, type, title });
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => { setToast(null); toastTimer.current = null; }, 3500);
+  }, []);
+
+  const remember = useCallback((m) => {
+    const channelKey = channelRef.current;
+    const previousId = lastSeenId.current[channelKey] || 0;
+    if (m.id && m.id > previousId) lastSeenId.current[channelKey] = m.id;
+    setMessages(prev => ({ ...prev, [m.id]: m }));
+    setReactions(prev => {
+      if (m.reactions) return { ...prev, [m.id]: m.reactions.slice() };
+      if (prev[m.id]) return prev;
+      return { ...prev, [m.id]: [] };
+    });
+  }, []);
+
+  const patchReactions = useCallback((messageId, fn) => {
+    setReactions(prev => ({ ...prev, [messageId]: fn(prev[messageId] || []) }));
+  }, []);
+
+  const ingestLive = useCallback((raw) => {
+    if (raw?.type === "message_deleted") {
+      const deleted = new Set(raw.ids || [raw.message_id]);
+      setMessages(prev => Object.fromEntries(Object.entries(prev).filter(([id]) => !deleted.has(Number(id)))));
+      setOrder(prev => prev.filter(id => !deleted.has(id)));
+      setReplyCounts(prev => Object.fromEntries(Object.entries(prev).filter(([id]) => !deleted.has(Number(id)))));
+      return;
+    }
+    if (raw?.type === "reaction") {
+      patchReactions(raw.message_id, (list, r = { author: raw.author, emoji: raw.emoji }) =>
+        list.some(x => x.author === r.author && x.emoji === r.emoji) ? list : [...list, r]);
+      return;
+    }
+    if (raw?.type === "reaction_removed") {
+      patchReactions(raw.message_id, (list) =>
+        list.filter(r => !(r.author === raw.author && r.emoji === raw.emoji)));
+      return;
+    }
+    const m = { reactions: [], ...raw };
+    setMessages(prev => {
+      if (prev[m.id]) return prev;
+      return { ...prev, [m.id]: m };
+    });
+    const channelKey = channelRef.current;
+    const previousId = lastSeenId.current[channelKey] || 0;
+    if (m.id && m.id > previousId) lastSeenId.current[channelKey] = m.id;
+    setReactions(prev => (prev[m.id] ? prev : { ...prev, [m.id]: m.reactions || [] }));
+    if (m.parent_id) {
+      setReplyCounts(prev => ({ ...prev, [m.parent_id]: (prev[m.parent_id] || 0) + 1 }));
+      setThreadId(tid => {
+        if (tid === m.parent_id) setThreadReplies(list => list.some(x => x.id === m.id) ? list : [...list, m]);
+        return tid;
+      });
+      return;
+    }
+    if (m.author_kind === "agent") {
+      setTyping("");
+      setStreamingAgents(prev => {
+        if (!prev[m.author]) return prev;
+        const next = { ...prev };
+        delete next[m.author];
+        return next;
+      });
+      setStreamText(prev => {
+        if (!(m.author in prev)) return prev;
+        const next = { ...prev };
+        delete next[m.author];
+        return next;
+      });
+    }
+    setOrder(prev => (prev.includes(m.id) ? prev : [...prev, m.id]));
+    if (m.author_kind === "system") loadComputer();
+  }, [patchReactions]);
+
+  // ── Data Loaders ──
+  function authError(message, status) {
+    const err = new Error(message);
+    err.status = status;
+    return err;
+  }
+
+  async function loadChannels() {
+    if (!tokenRef.current) return [];
+    const res = await apiJson("/api/channels", { token: tokenRef.current, cacheTtl: CACHE_TTL.list });
+    if (!res.ok) throw authError("channels", res.status);
+    setChannels(res.data);
+    return res.data;
+  }
+
+  async function loadAllAgents() {
+    if (!tokenRef.current) return;
+    try {
+      const res = await apiJson("/api/agents", { token: tokenRef.current, cacheTtl: CACHE_TTL.list });
+      setAllAgents(res.ok ? res.data : []);
+    } catch { setAllAgents([]); }
+  }
+
+  async function loadAgents(channelId) {
+    if (!tokenRef.current) return;
+    try {
+      const path = `/api/agents?channel_id=${encodeURIComponent(channelId)}`;
+      const res = await apiJson(path, { token: tokenRef.current, cacheTtl: CACHE_TTL.list });
+      setAgents(res.ok ? res.data : []);
+    } catch { setAgents([]); }
+  }
+
+  async function loadGroqStatus() {
+    try {
+      const pub = await apiJson("/api/status", { cacheTtl: CACHE_TTL.status });
+      const authed = tokenRef.current ? await apiJson("/api/status", { token: tokenRef.current, cacheTtl: CACHE_TTL.status }) : pub;
+      const data = authed.ok ? authed.data : (pub.data || {});
+      setDemoMode(!!data.demo);
+      if (data.me?.role) setMeRole(data.me.role);
+    } catch { setDemoMode(false); }
+  }
+
+  async function loadApprovals() {
+    if (!tokenRef.current) return;
+    try {
+      const res = await apiJson("/api/approvals?status=pending", { token: tokenRef.current, cacheTtl: 10_000 });
+      setApprovals(res.ok ? res.data : []);
+    } catch { setApprovals([]); }
+  }
+
+  async function loadComputer() {
+    if (!tokenRef.current) return;
+    try {
+      const res = await apiJson("/api/computer", { token: tokenRef.current, cacheTtl: CACHE_TTL.list });
+      setComputer(res.ok ? res.data : null);
+    } catch { setComputer(null); }
+  }
+
+  async function loadContextStats(channelId) {
+    if (!tokenRef.current) return;
+    try {
+      const agentName = bot?.name || allAgents[0]?.name;
+      const path = `/api/channels/${channelId}/context${agentName ? `?agent=${encodeURIComponent(agentName)}` : ""}`;
+      const res = await apiJson(path, { token: tokenRef.current });
+      if (res.ok) { setContextStats(res.data); setContextError(false); }
+      else setContextError(true);
+    } catch { setContextError(true); }
+  }
+
+  async function loadTeams() {
+    if (!tokenRef.current) return;
+    try {
+      const res = await apiJson("/api/teams", { token: tokenRef.current, cacheTtl: CACHE_TTL.list });
+      setTeams(res.ok ? res.data : []);
+    } catch { setTeams([]); }
+  }
+
+  async function loadHistory(channelId, beforeId) {
+    if (!tokenRef.current) throw new Error("auth");
+    const params = new URLSearchParams({ limit: String(HISTORY_LIMIT) });
+    if (beforeId) params.set("before_id", String(beforeId));
+    const res = await apiJson(`/api/channels/${channelId}/messages?${params}`, { token: tokenRef.current });
+    if (!res.ok) throw authError("history", res.status);
+    return res.data;
+  }
+
+  function applyHistory(history, prepend = false) {
+    setHasMore(history.length === HISTORY_LIMIT);
+    const nextMsgs = {}, nextReact = {}, counts = {};
+    for (const m of history) {
+      nextMsgs[m.id] = m;
+      nextReact[m.id] = m.reactions ? m.reactions.slice() : [];
+      if (m.parent_id) counts[m.parent_id] = (counts[m.parent_id] || 0) + 1;
+      if (m.id > (lastSeenId.current[channelId] || 0)) lastSeenId.current[channelId] = m.id;
+    }
+    setMessages(prev => ({ ...prev, ...nextMsgs }));
+    setReactions(prev => ({ ...prev, ...nextReact }));
+    setReplyCounts(prev => ({ ...prev, ...counts }));
+    setOrder(prev => {
+      const ids = history.map(m => m.id);
+      return prepend ? [...ids, ...prev] : [...prev, ...ids.filter(id => !prev.includes(id))];
+    });
+  }
+
+  async function loadChannelMessages(channelId) {
+    const req = ++loadReq.current;
+    const fresh = () => req === loadReq.current;
+    setLoadingLog(true);
+    setMessages({});
+    setOrder([]);
+    setReplyCounts({});
+    setReactions({});
+    setThreadId(null);
+    setThreadReplies([]);
+    try {
+      const history = await loadHistory(channelId);
+      if (!fresh()) return; // channel switched mid-flight — drop stale data
+      applyHistory(history);
+      await Promise.all([loadAgents(channelId), loadComputer(), loadApprovals()]);
+      if (!fresh()) return;
+      loadContextStats(channelId);
+    } catch (e) {
+      if (!fresh()) return;
+      if (e?.status === 401) {
+        flash("Session expired — please sign in again", "warning");
+        handleLogout();
+      } else {
+        flash("Failed to load messages", "error");
+      }
+    } finally { if (fresh()) setLoadingLog(false); }
+  }
+
+  // ── WebSocket ──
+  function connectWs() {
+    if (!tokenRef.current) return;
+    const t = tokenRef.current;
+    const proto = location.protocol === "https:" ? "wss" : "ws";
+    const url = `${proto}://${location.host}/ws/${encodeURIComponent(channelRef.current)}`;
+    intentionalClose.current = false;
+    setWsStatus("connecting");
+    const gen = ++wsGen.current;
+    const ws = new WebSocket(url);
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      if (gen !== wsGen.current) { ws.close(); return; }
+      reconnectAttempt.current = 0;
+      setWsStatus("connected");
+      ws.send(JSON.stringify({ token: t, last_seen_id: lastSeenId.current[channelRef.current] || null }));
+    };
+    ws.onmessage = (ev) => {
+      if (gen !== wsGen.current) return; // stale socket from a previous channel
+      let msg; try { msg = JSON.parse(ev.data); } catch { return; }
+      if (msg.type === "message" || msg.type === "live") ingestLive(msg.message || msg.data || msg);
+      else if (msg.type === "message_deleted" || msg.type === "reaction") ingestLive(msg);
+      else if (msg.type === "channel_deleted" && msg.channel_id) handleChannelDeletedRef.current?.(msg.channel_id);
+      else if (msg.type === "typing") setTyping(msg.author);
+      else if (msg.type === "agents_changed") {
+        loadChannels(); loadAllAgents(); loadTeams();
+        flash("New bot is ready — check the sidebar", "success");
+      }
+      else if (msg.type === "work" && msg.event) ingestWorkEventRef.current?.(msg.event);
+      else if (msg.type === "agent_stream_start" && msg.author) {
+        setStreamingAgents(prev => ({ ...prev, [msg.author]: true }));
+        setStreamText(prev => ({ ...prev, [msg.author]: "" }));
+        setTyping(msg.author);
+      }
+      else if (msg.type === "agent_token" && msg.author) {
+        setStreamingAgents(prev => ({ ...prev, [msg.author]: true }));
+        setTyping(msg.author);
+        const delta = typeof msg.delta === "string" ? msg.delta : "";
+        if (delta) {
+          setStreamText(prev => ({ ...prev, [msg.author]: ((prev[msg.author] || "") + delta).slice(-30000) }));
+        }
+      }
+      else if (msg.type === "status") { /* agent status updates */ }
+      else if (msg.type === "error") flash(msg.detail || "Error", "error");
+    };
+    ws.onclose = (ev) => {
+      if (gen !== wsGen.current) return; // superseded by a newer connection
+      if (intentionalClose.current || ev.code === 4001) { setWsStatus("offline"); return; }
+      setWsStatus("offline");
+      const delay = Math.min(1000 * 2 ** reconnectAttempt.current, 15000);
+      reconnectAttempt.current++;
+      reconnectTimer.current = setTimeout(connectWs, delay);
+    };
+    ws.onerror = () => { ws.close(); };
+  }
+
+  function disconnectWs() {
+    intentionalClose.current = true;
+    wsGen.current++; // invalidate in-flight socket callbacks
+    if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
+    if (wsRef.current) wsRef.current.close();
+  }
+
+  // ── Auth ──
+  // The backend has a single unified auth endpoint: POST /api/register.
+  // For an existing handle it returns a fresh token (login); for a new
+  // handle it creates the user (first user becomes admin). There is no
+  // separate /api/login route.
+  async function handleLogin(handle, password) {
+    const res = await apiJson("/api/register", { method: "POST", body: { handle, password } });
+    if (!res.ok) throw new Error(res.data.detail || "Login failed");
+    setUser({ handle }); setToken(res.data.token);
+    localStorage.setItem("swarm_token", res.data.token);
+    localStorage.setItem("swarm_handle", handle);
+  }
+
+  async function handleSetup(handle, password) {
+    const res = await apiJson("/api/register", { method: "POST", body: { handle, password } });
+    if (!res.ok) throw new Error(res.data.detail || "Setup failed");
+    setUser({ handle }); setToken(res.data.token);
+    localStorage.setItem("swarm_token", res.data.token);
+    localStorage.setItem("swarm_handle", handle);
+  }
+
+  function handleLogout() {
+    disconnectWs();
+    localStorage.removeItem("swarm_token");
+    localStorage.removeItem("swarm_handle");
+    setUser(null); setToken(null); setChannels([]); setAllAgents([]); setMessages({}); setOrder([]);
+    setWsStatus("offline");
+  }
+
+  // ── Effects ──
+  useEffect(() => {
+    const savedToken = localStorage.getItem("swarm_token");
+    const savedHandle = localStorage.getItem("swarm_handle");
+    if (savedToken && savedHandle) { setToken(savedToken); setUser({ handle: savedHandle }); }
+    loadGroqStatus();
+  }, []);
+
+  useEffect(() => {
+    if (token) {
+      (async () => {
+        try {
+          await Promise.all([loadChannels(), loadAllAgents(), loadTeams()]);
+          await loadChannelMessages(channelRef.current);
+          connectWs();
+        } catch (e) {
+          if (e?.status === 401) {
+            // Stored token is stale (rotated or DB reset) — drop it and
+            // send the user back to sign-in instead of a dead error state.
+            flash("Session expired — please sign in again", "warning");
+            handleLogout();
+          } else {
+            flash("Failed to initialize", "error");
+          }
+        }
+      })();
+    }
+    return () => disconnectWs();
+  }, [token]);
+
+  useEffect(() => {
+    if (token && channel) {
+      setStreamText({});
+      setStreamingAgents({});
+      loadChannelMessages(channel);
+      disconnectWs();
+      connectWs();
+    }
+  }, [channel]);
+
+  // ── Keyboard shortcuts ──
+  useEffect(() => {
+    function onKey(e) {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") { e.preventDefault(); setCmdOpen(true); }
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "c" && user) { e.preventDefault(); setComputerOpen(o => !o); }
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "w" && user) {
+        e.preventDefault();
+        setWorkRailOpen(o => { localStorage.setItem("swarm_work_rail", o ? "0" : "1"); return !o; });
+      }
+      if (e.key === "Escape") { setCmdOpen(false); setThreadId(null); setSelectedWork(null); setSidebarOpen(false); }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [user]);
+
+  function persistOutbox(next) {
+    setOutbox(next);
+    try { localStorage.setItem("swarm.outbox", JSON.stringify(next)); } catch { /* private mode */ }
+  }
+
+  function queueMessage(channelId, entry) {
+    persistOutbox(prev => ({ ...prev, [channelId]: [...(prev[channelId] || []), entry] }));
+  }
+
+  // ── Send ──
+  async function sendMessage(text, parentId = null, opts = null) {
+    if (!tokenRef.current) return false;
+    const model = (opts && "model" in opts ? opts.model : chatModel) || null;
+    const channelId = channelRef.current;
+    const author = user.handle;
+    const body = { author, body: text, author_kind: "human", parent_id: parentId };
+    if (model) body.model = model;
+    try {
+      let res = await apiJson(`/api/channels/${channelId}/messages`, {
+        token: tokenRef.current, method: "POST", body,
+      });
+      // The API intentionally rate-limits writes to 500ms. A chat composer
+      // should never lose a message because the user typed immediately after
+      // login or a previous send, so transparently wait and retry once.
+      if (res.status === 429) {
+        await new Promise((resolve) => window.setTimeout(resolve, 650));
+        res = await apiJson(`/api/channels/${channelId}/messages`, {
+          token: tokenRef.current, method: "POST", body,
+        });
+      }
+      if (!res.ok) {
+        if (res.status === 0 || res.status >= 500) {
+          // Server/network outage: queue for automatic resend, don't drop.
+          queueMessage(channelId, { author, text, parentId, model });
+          flash("Connection lost — message queued, will send on reconnect", "warning");
+          return true;
+        }
+        setSendFailure({ text, parentId, model, detail: res.data?.detail || "Message could not be sent" });
+        return false;
+      }
+      setSendFailure(prev => (prev?.text === text && prev?.parentId === parentId ? null : prev));
+      remember(res.data);
+      loadContextStats(channelId);
+      return true;
+    } catch {
+      // Fetch threw (offline): queue for automatic resend, don't drop.
+      queueMessage(channelId, { author, text, parentId, model });
+      flash("You're offline — message queued, will send on reconnect", "warning");
+      return true;
+    }
+  }
+
+  // Flush the offline outbox whenever the socket reconnects.
+  useEffect(() => {
+    if (wsStatus !== "connected" || !tokenRef.current) return;
+    const pending = outbox[channelRef.current] || [];
+    if (!pending.length) return;
+    let cancelled = false;
+    (async () => {
+      for (const entry of pending) {
+        if (cancelled) return;
+        const body = { author: entry.author, body: entry.text, author_kind: "human", parent_id: entry.parentId };
+        if (entry.model) body.model = entry.model;
+        try {
+          const res = await apiJson(`/api/channels/${channelRef.current}/messages`, {
+            token: tokenRef.current, method: "POST", body,
+          });
+          if (!res.ok) return; // keep the rest queued; try again next reconnect
+          if (res.data) remember(res.data);
+        } catch {
+          return;
+        }
+        persistOutbox(prev => {
+          const rest = (prev[channelRef.current] || []).slice(1);
+          const next = { ...prev };
+          if (rest.length) next[channelRef.current] = rest;
+          else delete next[channelRef.current];
+          return next;
+        });
+      }
+      loadContextStats(channelRef.current);
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [wsStatus]);
+
+  async function stopChat() {
+    try {
+      const res = await apiJson(`/api/channels/${channelRef.current}/stop`, {
+        token: tokenRef.current, method: "POST",
+      });
+      if (res.ok) {
+        const n = res.data?.stopped || 0;
+        flash(n ? `Stopped ${n} running repl${n === 1 ? "y" : "ies"} — partial text kept` : "Nothing running", n ? "warning" : "info");
+      } else {
+        flash(res.data?.detail || "Could not stop", "error");
+      }
+    } catch {
+      flash("Could not stop — check your connection", "error");
+    }
+  }
+
+  async function retryFailedSend() {
+    if (!sendFailure) return;
+    const { text, parentId, model } = sendFailure;
+    const ok = await sendMessage(text, parentId, { model });
+    if (ok) setSendFailure(null);
+  }
+
+  async function onRetryAgent(m) {
+    if (!tokenRef.current || retryingId) return;
+    setRetryingId(m.id);
+    try {
+      const res = await apiJson(`/api/messages/${m.id}/retry`, {
+        token: tokenRef.current, method: "POST",
+      });
+      if (!res.ok) flash(res.data?.detail || "Retry failed", "error");
+    } catch {
+      flash("Retry failed — check your connection", "error");
+    } finally {
+      setRetryingId(null);
+    }
+  }
+
+  async function onReply(parentId) {
+    setThreadId(parentId);
+    try {
+      const res = await apiJson(`/api/messages/${parentId}/thread`, { token: tokenRef.current });
+      if (res.ok) setThreadReplies(res.data.replies || []);
+    } catch { setThreadReplies([]); }
+  }
+  async function onReact(messageId, target) {
+    const emoji = typeof target === "string" ? target : "👍";
+    const res = await apiJson(`/api/messages/${messageId}/reactions`, {
+      token: tokenRef.current,
+      method: "POST",
+      body: { author: user.handle, emoji },
+    });
+    if (res.ok) {
+      patchReactions(messageId, (mine) => {
+        const r = { author: user.handle, emoji };
+        return mine.some(x => x.author === r.author && x.emoji === r.emoji) ? mine : [...mine, r];
+      });
+    }
+    else flash("Could not add reaction", "error");
+  }
+  async function onUnreact(messageId, emoji) {
+    const res = await apiJson(
+      `/api/messages/${messageId}/reactions?emoji=${encodeURIComponent(emoji)}`,
+      { token: tokenRef.current, method: "DELETE" },
+    );
+    if (res.ok) {
+      patchReactions(messageId, (mine) =>
+        mine.filter(r => !(r.author === user.handle && r.emoji === emoji)));
+    }
+    else flash("Could not remove reaction", "error");
+  }
+  async function onDelete(m) {
+    const res = await apiJson(`/api/messages/${m.id}`, { token: tokenRef.current, method: "DELETE" });
+    if (res.ok) flash("Message deleted", "info");
+    else flash(res.data?.detail || "Could not delete message", "error");
+  }
+
+  async function onDeleteChannel(channelId) {
+    const target = channels.find(c => c.id === channelId);
+    if (!target || target.kind === "dm") return;
+    if (!window.confirm(`Delete #${target.name}? All of its messages will be removed.`)) return;
+    const res = await apiJson(`/api/channels/${channelId}`, { token: tokenRef.current, method: "DELETE" });
+    if (res.ok) {
+      flash(`Deleted #${target.name}`, "info");
+      handleChannelDeleted(channelId);
+    }
+    else flash(res.data?.detail || "Could not delete channel", "error");
+  }
+
+  function handleChannelDeleted(channelId) {
+    setChannels(prev => prev.filter(c => c.id !== channelId));
+    if (channelRef.current === channelId) {
+      setChannel(prev => {
+        if (prev !== channelId) return prev;
+        const fallback = channels.find(c => c.id !== channelId);
+        return fallback ? fallback.id : "general";
+      });
+    }
+  }
+
+  async function onResolveApproval(id, decision) {
+    const res = await apiJson(`/api/approvals/${id}/resolve`, { token: tokenRef.current, method: "POST", body: { status: decision } });
+    if (res.ok) { flash(`Approval ${decision}`, decision === "approved" ? "success" : "warning"); loadApprovals(); }
+    else flash(res.data?.detail || "Approval failed", "error");
+  }
+
+  // ── Command palette commands ──
+  const commands = useMemo(() => [
+    { id: "cmd-new-channel", group: "Create", label: "New channel", hint: "room", keywords: ["channel", "room"], action: () => setQuickAction("channel") },
+    { id: "cmd-new-agent", group: "Create", label: "New agent", hint: "bot", keywords: ["agent", "bot", "teammate"], action: () => setQuickAction("agent") },
+    { id: "cmd-new-group", group: "Create", label: "New group", hint: "pod", keywords: ["group", "team", "pod"], action: () => setQuickAction("group") },
+    { id: "cmd-new-dm", group: "Create", label: "New direct message", hint: "person", keywords: ["dm", "message", "person"], action: () => setQuickAction("dm") },
+    { id: "cmd-toggle-computer", group: "View", label: "Toggle computer panel", keywords: ["computer", "sandbox", "screen"], action: () => setComputerOpen(o => !o) },
+    { id: "cmd-view-talk", group: "View", label: "Go to Talk", keywords: ["chat", "message"], action: () => setMainView("talk") },
+    { id: "cmd-view-paper", group: "View", label: "Go to Paper", keywords: ["paper", "latex", "doc"], action: () => setMainView("paper") },
+    { id: "cmd-view-files", group: "View", label: "Go to Files", keywords: ["files", "sandbox"], action: () => setMainView("files") },
+    ...rooms.map(c => ({ id: `ch-${c.id}`, group: "Channels", label: c.name, keywords: [c.name], action: () => { setChannel(c.id); setMainView("talk"); } })),
+    ...allAgents.map(a => ({ id: `ag-${a.name}`, group: "Agents", label: a.display_name || a.name, keywords: [a.name, a.job], action: () => { setChannel(a.dm_channel_id); setMainView("talk"); } })),
+  ], [rooms, allAgents]);
+
+  // ── Render ──
+  if (!user || !token) {
+    return <LoginScreen onLogin={handleLogin} onSetup={handleSetup} status={wsStatus} demoMode={demoMode} />;
+  }
+
+  return (
+    <div className={`app workspace ${threadId ? "thread-open" : ""} ${computerOpen ? "computer-open" : ""} ${workRailOpen ? "work-rail-open" : ""} ${rosterFolded ? "roster-folded" : ""}`}>
+      <Sidebar
+        user={user}
+        channels={channels}
+        agents={allAgents}
+        teams={teams}
+        onSelectChannel={(id) => { setChannel(id); setMainView("talk"); setSidebarOpen(false); }}
+        activeChannel={channel}
+        wsStatus={wsStatus}
+        meRole={meRole}
+        onNewChannel={() => setQuickAction("channel")}
+        onNewDM={() => setQuickAction("dm")}
+        onNewGroup={() => setQuickAction("group")}
+        onNewTeam={() => setQuickAction("team")}
+        onNewAgent={() => setQuickAction("agent")}
+        onLogout={handleLogout}
+        onOpenSettings={() => { setSidebarOpen(false); setMainView("dashboard"); }}
+        onDeleteChannel={onDeleteChannel}
+        currentView={mainView}
+        onViewChange={(v) => { setSidebarOpen(false); setMainView(
+          v === "home" ? "dashboard" : v === "work" ? "work" : v === "chat" ? "talk" : v
+        ); }}
+        workAttentionCount={workAttention.length}
+        open={sidebarOpen}
+        onClose={() => setSidebarOpen(false)}
+        collapsed={rosterFolded}
+        onToggleCollapsed={() => setRosterFolded((folded) => {
+          localStorage.setItem("swarm_roster_folded", folded ? "0" : "1");
+          return !folded;
+        })}
+      />
+      {sidebarOpen && (
+        <div className="sidebar-backdrop" onClick={() => setSidebarOpen(false)} aria-hidden />
+      )}
+
+      <div className="workspace-shell">
+        <TopBar
+          channel={current}
+          agents={agents}
+          onToggleComputer={() => setComputerOpen(o => !o)}
+          computerOpen={computerOpen}
+          onOpenCommandPalette={() => setCmdOpen(true)}
+          onOpenSidebar={() => setSidebarOpen(true)}
+          onViewChange={setMainView}
+          currentView={mainView}
+          approvals={approvals}
+          onResolveApproval={onResolveApproval}
+          wsStatus={wsStatus}
+          workActive={activeWorkHere}
+          workAttention={workAttention}
+          workConnected={workConnected}
+          workRailOpen={workRailOpen}
+          onToggleWorkRail={() => setWorkRailOpen(o => {
+            localStorage.setItem("swarm_work_rail", o ? "0" : "1");
+            return !o;
+          })}
+          participants={[...new Set(order.map(id => messages[id]?.author).filter(Boolean))]}
+        />
+
+        <main id="main">
+          {["dashboard", "home"].includes(mainView) && <CommandCenter token={token} agents={allAgents} flash={flash} onOpenRun={setSelectedRun} />}
+          {["work", "workflows", "runs"].includes(mainView) && <WorkHome token={token} onOpenRun={setSelectedRun} />}
+          {mainView === "talk" && (
+            <MessageList
+              messages={messages}
+              order={order}
+              agents={agents}
+              allAgents={allAgents}
+              channelName={current.name}
+              onQuickStart={(text) => setComposerPrefill(text)}
+              user={user}
+              onReply={onReply}
+              onReact={onReact}
+              onUnreact={onUnreact}
+              onDelete={onDelete}
+              onOpenThread={onReply}
+              onRetry={onRetryAgent}
+              retryingId={retryingId}
+              replyCounts={replyCounts}
+              reactions={reactions}
+              channelId={channel}
+              streamingAgents={streamingAgents}
+              streamText={streamText}
+              workByMessage={workByMessage}
+              eventsByWork={eventsByWork}
+              canModerate={meRole === "admin"}
+              onLoadMore={async () => {
+                if (loadingLog || order.length === 0) return;
+                setLoadingLog(true);
+                try {
+                  const history = await loadHistory(channelRef.current, order[0]);
+                  applyHistory(history, true);
+                } catch { flash("Failed to load earlier messages", "error"); }
+                finally { setLoadingLog(false); }
+              }}
+              hasMore={hasMore}
+              loadingMore={loadingLog}
+              typing={typing}
+              groupedWith={(prev, m) => {
+                if (!prev) return false;
+                if (prev.author !== m.author) return false;
+                if (prev.author_kind !== m.author_kind) return false;
+                if (m.parent_id) return false;
+                const toMs = (t) => typeof t === "number" ? t * 1000 : Date.parse(t) || 0;
+                const dt = toMs(m.created_at) - toMs(prev.created_at);
+                return dt >= 0 && dt < 5 * 60 * 1000;
+              }}
+            />
+          )}
+
+          {mainView === "paper" && <PaperView messages={roots} title={current.name} />}
+          {mainView === "files" && <FilesView computer={computer} />}
+          {mainView === "agents" && <AgentsView agents={allAgents} onOpenChannel={(id) => { setChannel(id); setMainView("talk"); }} />}
+          {mainView === "knowledge" && <KnowledgeView token={token} flash={flash} />}
+        </main>
+
+        {mainView === "talk" && (
+          <>
+            {sendFailure && !threadId && (
+              <div className="send-failure-banner" role="alert">
+                <span className="send-failure-text">{sendFailure.detail}</span>
+                <div className="send-failure-actions">
+                  <button type="button" className="send-failure-retry" onClick={retryFailedSend}>Retry</button>
+                  <button type="button" className="send-failure-dismiss" onClick={() => setSendFailure(null)} aria-label="Dismiss">Dismiss</button>
+                </div>
+              </div>
+            )}
+            {showContext && (
+              <ContextDrawer
+                stats={contextStats}
+                included={[`#${current.name}`, ...workingWith.map(a => `@${a}`)]}
+                onRefresh={() => loadContextStats(channelRef.current)}
+                onClose={() => setShowContext(false)}
+              />
+            )}
+            {(outbox[channel] || []).length > 0 && (
+              <div className="send-failure-banner" role="status">
+                <span className="send-failure-text">
+                  {(outbox[channel] || []).length} queued — sending on reconnect
+                </span>
+              </div>
+            )}
+            <Composer
+              onSend={(text, opts) => sendMessage(text, null, opts)}
+              channelName={current.name}
+              agents={agents}
+              placeholder={`Message ${current.name}…`}
+              workingWith={workingWith}
+              offline={wsStatus === "offline"}
+              sendFailed={!!sendFailure && !threadId}
+              contextStats={contextStats}
+              contextError={contextError}
+              onRefreshContext={() => loadContextStats(channelRef.current)}
+              contextDetailsOpen={showContext}
+              onToggleContextDetails={() => setShowContext(s => !s)}
+              token={token}
+              model={chatModel}
+              onModelChange={setChatModel}
+              working={chatBusy}
+              onStop={stopChat}
+              prefill={composerPrefill}
+              onPrefillConsumed={() => setComposerPrefill("")}
+            />
+          </>
+        )}
+      </div>
+
+      <WorkRail
+        sessions={mainView === "talk" ? workSessions.filter(s => !s.channel_id || s.channel_id === channel) : workSessions}
+        eventsByWork={eventsByWork}
+        agents={allAgents}
+        approvals={approvals}
+        token={token}
+        channelId={channel}
+        selectedWork={selectedWork}
+        onSelectWork={setSelectedWork}
+        onCancelWork={refreshWork}
+        onResolveApproval={async (approvalId, decision) => {
+          if (approvalId) {
+            const res = await apiJson(`/api/approvals/${approvalId}/resolve`, {
+              token: tokenRef.current, method: "POST", body: { status: decision },
+            });
+            if (res.ok) { flash(`Approval ${decision}`, decision === "approved" ? "success" : "warning"); loadApprovals(); refreshWork(); }
+            else flash(res.data?.detail || "Approval failed", "error");
+          }
+        }}
+        onOpenThread={onReply}
+        collapsed={!workRailOpen}
+        connected={workConnected}
+        error={workError}
+        onRetry={refreshWork}
+        onToggle={() => setWorkRailOpen(o => {
+          localStorage.setItem("swarm_work_rail", o ? "0" : "1");
+          return !o;
+        })}
+      />
+
+      {selectedRun && (
+        <div className="run-monitor-backdrop" role="dialog" aria-modal="true" onClick={(e) => { if (e.target === e.currentTarget) setSelectedRun(null); }}>
+          <section className="run-monitor">
+            <button className="panel-close" onClick={() => setSelectedRun(null)} aria-label="Close run detail"><X size={14} /></button>
+            <WorkRunDetail run={selectedRun} token={token} onStatusChange={setSelectedRun} />
+          </section>
+        </div>
+      )}
+      {selectedWork && (() => {
+        const detail = workSessions.find(s => s.id === selectedWork);
+        if (!detail) return null;
+        return (
+          <WorkRailSheet open onClose={() => setSelectedWork(null)}>
+            <WorkDetail
+              session={detail}
+              events={eventsByWork[detail.id] || []}
+              token={token}
+              agents={allAgents}
+              approvals={approvals}
+              onCancel={async () => {
+                try { await cancelWork(tokenRef.current, detail.id); refreshWork(); }
+                catch { flash("Could not cancel work", "error"); }
+              }}
+              onResolveApproval={async (approvalId, decision, session) => {
+                if (!approvalId) return;
+                const res = await apiJson(`/api/approvals/${approvalId}/resolve`, {
+                  token: tokenRef.current, method: "POST", body: { status: decision },
+                });
+                if (res.ok) { flash(`Approval ${decision}`, decision === "approved" ? "success" : "warning"); loadApprovals(); refreshWork(); }
+                else flash(res.data?.detail || "Approval failed", "error");
+              }}
+              onOpenThread={onReply}
+              onClose={() => setSelectedWork(null)}
+            />
+          </WorkRailSheet>
+        );
+      })()}
+      {quickAction && <QuickCreateModal action={quickAction} token={token} agents={allAgents} onClose={() => setQuickAction(null)} onCreated={async (id) => { setQuickAction(null); await loadChannels(); await loadAllAgents(); await loadTeams(); if (id) { setChannel(id); setMainView("talk"); } flash("Created", "success"); }} />}
+
+      {computerOpen && (
+        <ComputerPanel
+          computer={computer}
+          token={token}
+          user={user}
+          meRole={meRole}
+          onClose={() => setComputerOpen(false)}
+          onRefresh={loadComputer}
+          flash={flash}
+        />
+      )}
+
+      {threadId && (
+        <ThreadPanel
+          parentId={threadId}
+          messages={messages}
+          threadReplies={threadReplies}
+          allAgents={allAgents}
+          user={user}
+          onClose={() => setThreadId(null)}
+          onSend={(text, opts) => sendMessage(text, threadId, opts)}
+          token={token}
+          chatModel={chatModel}
+          onModelChange={setChatModel}
+          streamText={streamText}
+          onStop={stopChat}
+          onReact={onReact}
+          onUnreact={onUnreact}
+          onDelete={onDelete}
+          canModerate={meRole === "admin"}
+          onRetry={onRetryAgent}
+          retryingId={retryingId}
+          sendFailure={sendFailure?.parentId === threadId ? sendFailure : null}
+          onRetrySend={retryFailedSend}
+          onDismissSendFailure={() => setSendFailure(null)}
+          reactions={reactions}
+          working={chatBusy}
+        />
+      )}
+
+      <CommandPalette open={cmdOpen} onClose={() => setCmdOpen(false)} commands={commands} onCommand={(c) => c.action?.()} />
+
+      {toast && (
+        <div className={`toast-container ${toast.type === "error" ? "error" : ""}`} role="status" aria-live="polite">
+          <div className={`toast ${toast.type}`}>
+            {toast.title && <div className="toast-title">{toast.title}</div>}
+            <div className="toast-message">{toast.msg}</div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Views ──
+
+function PaperView({ messages, title }) {
+  const { code, math } = useMemo(() => {
+    const codeParts = [];
+    const mathParts = [];
+    for (const m of messages || []) {
+      if (!m?.body || m.author_kind === "system") continue;
+      const text = String(m.body);
+      const codeRe = /```(\w*)\r?\n([\s\S]*?)```/g;
+      let match;
+      while ((match = codeRe.exec(text))) {
+        codeParts.push({ id: `${m.id}-${match.index}`, lang: match[1] || "code", text: match[2].trimEnd(), author: m.author });
+      }
+      if (text.includes("$")) {
+        const inline = text.match(/\$(?!\$)([^$\n]+?)\$/g) || [];
+        for (const tex of inline.slice(0, 8)) mathParts.push({ id: `${m.id}-${tex}`, tex, author: m.author });
+      }
+    }
+    return { code: codeParts.slice(0, 12), math: mathParts.slice(0, 12) };
+  }, [messages]);
+  return (
+    <div id="log" className="paper-log">
+      <article className="paper-doc">
+        <p className="paper-kicker">swarm preprint</p>
+        <h1>{title}</h1>
+        <p className="paper-meta">
+          {code.length + math.length === 0
+            ? "A compiled view of this channel · talk stays in Talk"
+            : `${code.length} code listing${code.length === 1 ? "" : "s"} · ${math.length} math note${math.length === 1 ? "" : "s"} · talk stays in Talk`}
+        </p>
+        <section aria-label="Code listings">
+          <h2>Code</h2>
+          {code.length === 0 && <p className="paper-empty">No code listings yet — share a fenced code block in Talk and it will compile here.</p>}
+          {code.map(c => (
+            <div key={c.id} className="paper-item">
+              <CodeBlock lang={c.lang} text={c.text} />
+              <p className="paper-item-meta text-mono-xs text-subtle">from {c.author}</p>
+            </div>
+          ))}
+        </section>
+        <section aria-label="Math notes">
+          <h2>Mathematics</h2>
+          {math.length === 0 && <p className="paper-empty">No TeX yet — inline $math$ in Talk appears here.</p>}
+          {math.length > 0 && (
+            <ul className="paper-math-list">
+              {math.map(m => (
+                <li key={m.id} className="paper-math-row">
+                  <code className="math-fallback">{m.tex}</code>
+                  <span className="paper-item-meta text-mono-xs text-subtle">from {m.author}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+      </article>
+    </div>
+  );
+}
+
+function FilesView({ computer }) {
+  const [query, setQuery] = useState("");
+  if (!computer) {
+    return (
+      <div id="log" className="files-view">
+        <EmptyState
+          kind="folder"
+          title="No sandbox connected"
+          message="The shared workspace is offline. Open the computer panel from the top bar to browse files and run commands."
+        />
+      </div>
+    );
+  }
+  const files = computer.files || [];
+  const q = query.trim().toLowerCase();
+  const visible = q ? files.filter(f => String(f.name || f.path || "").toLowerCase().includes(q)) : files;
+  return (
+    <div id="log" className="files-view">
+      <div className="files-header">
+        <div className="files-header-main">
+          <span className="text-mono-xs text-subtle" title={computer.cwd}>{computer.cwd}</span>
+          <span className="text-mono-xs text-subtle">· {files.length} item{files.length === 1 ? "" : "s"}</span>
+        </div>
+        {files.length > 4 && (
+          <input
+            type="search"
+            className="input agents-view-search"
+            placeholder="Filter files…"
+            value={query}
+            onChange={e => setQuery(e.target.value)}
+            aria-label="Filter files"
+          />
+        )}
+      </div>
+      <ScrollArea className="files-list">
+        {visible.length === 0 && (
+          <EmptyState
+            kind="folder"
+            title={q ? "No matches" : "Empty sandbox"}
+            message={q ? `Nothing matches “${query.trim()}”.` : "Agents can write files here with write_workspace."}
+          />
+        )}
+        {visible.map(f => (
+          <div key={f.path || f.name} className="file-row" role="listitem" tabIndex={0}>
+            <span className="file-icon" aria-hidden>{f.is_dir ? <Folder size={14} /> : <FileText size={14} />}</span>
+            <span className="file-info">
+              <span className="file-name">{f.path || f.name}</span>
+              {f.size != null && <span className="file-size text-mono-xs text-subtle">{fmtBytes(f.size)}</span>}
+            </span>
+          </div>
+        ))}
+      </ScrollArea>
+    </div>
+  );
+}
+
+function agentFlap(status) {
+  if (status === "working" || status === "running") return { value: "Work", tone: "amber" };
+  if (status === "needs_approval" || status === "waiting_for_approval") return { value: "Hold", tone: "hold" };
+  if (status === "idle" || status === "online") return { value: "Ready", tone: "go" };
+  return { value: "Off", tone: "unlit" };
+}
+
+function AgentsView({ agents, onOpenChannel }) {
+  const [query, setQuery] = useState("");
+  const q = query.trim().toLowerCase();
+  const filtered = agents.filter(a => !q
+    || (a.name || "").toLowerCase().includes(q)
+    || (a.display_name || "").toLowerCase().includes(q)
+    || (a.job || "").toLowerCase().includes(q));
+  return (
+    <div id="log" className="agents-view">
+      <header className="agents-view-head">
+        <div>
+          <h2 className="agents-view-title">Roster</h2>
+          <p className="agents-view-sub">{agents.length} teammate{agents.length === 1 ? "" : "s"} · open a 1:1 to work</p>
+        </div>
+        <input
+          type="search"
+          className="input agents-view-search"
+          placeholder="Filter the roster"
+          value={query}
+          onChange={e => setQuery(e.target.value)}
+          aria-label="Filter teammates"
+        />
+      </header>
+      <div className="agents-grid scroll-y">
+        {filtered.length === 0 && (
+          <div className="agents-view-empty">
+            <EmptyState
+              kind="search"
+              title={agents.length === 0 ? "No teammates yet" : "No matches"}
+              message={agents.length === 0 ? "Create your first teammate to start working." : `No teammate matches “${query.trim()}”.`}
+            />
+          </div>
+        )}
+        {filtered.map(a => {
+          const flap = agentFlap(a.status);
+          return (
+            <Card
+              key={a.name}
+              interactive
+              onClick={() => onOpenChannel(a.dm_channel_id)}
+              onKeyDown={e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onOpenChannel(a.dm_channel_id); } }}
+              tabIndex={0}
+              role="button"
+              aria-label={`Open a 1:1 with ${a.display_name || a.name}`}
+            >
+              <div className="agent-card-head">
+                <Avatar name={a.display_name || a.name} kind="agent" size="sm" avatar={a.avatar} />
+                <div className="agent-card-meta">
+                  <span className="agent-card-name">{a.display_name || a.name}</span>
+                  <span className="agent-card-handle">@{a.name}</span>
+                </div>
+                <Flap value={flap.value} tone={flap.tone} />
+              </div>
+              {a.job && <p className="agent-card-job">{a.job}</p>}
+              {a.model && <p className="agent-card-model">{a.model}</p>}
+            </Card>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function ThreadPanel({ parentId, messages, threadReplies, allAgents, user, onClose, onSend, onReact, onUnreact, onDelete, canModerate, onRetry, retryingId, sendFailure, onRetrySend, onDismissSendFailure, reactions, token, chatModel, onModelChange, streamText, onStop, working }) {
+  const parent = messages[parentId];
+  const replies = threadReplies.length > 0 ? threadReplies : Object.values(messages).filter(m => m.parent_id === parentId);
+  const replyOrder = replies.map(r => r.id);
+  return (
+    <aside id="thread-panel">
+      <div className="panel-header">
+        <div className="panel-header-main">
+          <span className="panel-icon" aria-hidden>
+            <MessageSquare size={15} />
+          </span>
+          <div>
+            <h2 className="panel-title">Thread</h2>
+            <span className="panel-subtitle">{replies.length} repl{replies.length === 1 ? "y" : "ies"}</span>
+          </div>
+        </div>
+        <button className="panel-close" onClick={onClose} aria-label="Close thread"><X size={14} /></button>
+      </div>
+      <ScrollArea className="thread-body">
+        {parent && (
+          <div className="thread-parent">
+            <MessageList messages={messages} order={[parentId]} agents={[]} allAgents={allAgents} user={user} onReact={onReact} onUnreact={onUnreact} onDelete={onDelete} canModerate={canModerate} onRetry={onRetry} retryingId={retryingId} replyCounts={{}} reactions={reactions} channelId="" groupedWith={() => false} streamText={streamText} />
+          </div>
+        )}
+        <Divider />
+        {replyOrder.length > 0 && (
+          <MessageList messages={messages} order={replyOrder} agents={[]} allAgents={allAgents} user={user} onReact={onReact} onUnreact={onUnreact} onDelete={onDelete} canModerate={canModerate} onRetry={onRetry} retryingId={retryingId} replyCounts={{}} reactions={reactions} channelId="" groupedWith={() => false} streamText={streamText} />
+        )}
+      </ScrollArea>
+      {sendFailure && (
+        <div className="send-failure-banner thread" role="alert">
+          <span className="send-failure-text">{sendFailure.detail}</span>
+          <div className="send-failure-actions">
+            <button type="button" className="send-failure-retry" onClick={onRetrySend}>Retry</button>
+            <button type="button" className="send-failure-dismiss" onClick={onDismissSendFailure} aria-label="Dismiss">Dismiss</button>
+          </div>
+        </div>
+      )}
+      <Composer onSend={onSend} placeholder="Reply in thread…" compact threadParent token={token} model={chatModel} onModelChange={onModelChange} working={working} onStop={onStop} />
+    </aside>
+  );
+}
+
+function QuickCreateModal({ action, token, agents, onClose, onCreated }) {
+  const [name, setName] = useState("");
+  const [detail, setDetail] = useState("");
+  const [avatar, setAvatar] = useState("");
+  const [members, setMembers] = useState([]);
+  const [busy, setBusy] = useState(false);
+  const [templates, setTemplates] = useState([]);
+  const [templatesLoaded, setTemplatesLoaded] = useState(false);
+  const [selectedTemplate, setSelectedTemplate] = useState(null);
+  const labels = { channel: "New channel", dm: "New direct message", group: "New group", team: "New agent team", agent: "New agent" };
+  const needsMembers = action === "group" || action === "team";
+  const needsDetail = action !== "dm";
+  const isAgent = action === "agent";
+
+  useEffect(() => {
+    if (isAgent && !templatesLoaded) {
+      apiJson(`/api/agent-templates`, { token })
+        .then((res) => { setTemplates(res.ok && Array.isArray(res.data) ? res.data : []); setTemplatesLoaded(true); })
+        .catch(() => setTemplatesLoaded(true));
+    }
+  }, [isAgent, templatesLoaded, token]);
+
+  function selectTemplate(tpl) {
+    setSelectedTemplate(tpl.id);
+    setName(tpl.name);
+    setDetail(tpl.system_prompt);
+  }
+
+  async function submit(event) {
+    event.preventDefault();
+    if (!name.trim() || (needsMembers && !members.length)) return;
+    setBusy(true);
+    let path = "/api/channels";
+    let body = { name: name.trim() };
+    if (action === "dm") { path = "/api/dms"; body = { handle: name.trim() }; }
+    if (action === "group") { body = { name: name.trim(), topic: detail.trim(), kind: "group", members }; }
+    if (action === "team") { path = "/api/teams"; body = { name: name.trim(), description: detail.trim(), members }; }
+    if (action === "agent") {
+      const tpl = templates.find(t => t.id === selectedTemplate);
+      path = "/api/agents";
+      body = {
+        name: name.trim(),
+        display_name: name.trim(),
+        avatar: avatar.trim().slice(0, 500),
+        system_prompt: detail.trim() || `You are ${name.trim()}, a helpful specialist teammate.`,
+        job: tpl ? tpl.job : "Teammate",
+      };
+    }
+    const response = await apiJson(path, { token, method: "POST", body });
+    setBusy(false);
+    if (response.ok) onCreated(response.data?.id || response.data?.dm_channel_id);
+  }
+
+  useEffect(() => {
+    function onKey(e) {
+      if (e.key === "Escape") onClose?.();
+    }
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  return (
+    <div
+      className="quick-create-backdrop"
+      role="dialog"
+      aria-modal="true"
+      aria-label={labels[action]}
+      onClick={e => { if (e.target === e.currentTarget) onClose?.(); }}
+    >
+      <section className="quick-create">
+        <header className="run-monitor-head">
+          <div>
+            <h2>{labels[action]}</h2>
+          </div>
+          <button className="panel-close" onClick={onClose} aria-label="Close dialog"><X size={14} /></button>
+        </header>
+        <form className="quick-create-form" onSubmit={submit}>
+          {isAgent && templates.length > 0 && (
+            <div className="template-picker">
+              <span className="reg">Start from a template</span>
+              <div className="template-grid">
+                {templates.map(t => (
+                  <button
+                    key={t.id}
+                    type="button"
+                    className={`template-card${selectedTemplate === t.id ? " selected" : ""}`}
+                    onClick={() => selectTemplate(t)}
+                  >
+                    <span className="template-name">{t.display_name}</span>
+                    <span className="template-desc">{t.description}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+          <Input autoFocus value={name} onChange={e => { setName(e.target.value); setSelectedTemplate(null); }} placeholder={action === "dm" ? "Person handle" : action === "agent" ? "Agent handle" : "Name"} />
+          {isAgent && <Input value={avatar} onChange={e => setAvatar(e.target.value)} placeholder="Avatar — an emoji or image URL (optional)" aria-label="Bot avatar" />}
+          {needsDetail && <Textarea value={detail} onChange={e => { setDetail(e.target.value); setSelectedTemplate(null); }} placeholder={action === "agent" ? "What should this agent specialize in?" : "Description or topic (optional)"} rows={3} />}
+          {needsMembers && (
+            <label className="quick-members">
+              {agents.map(agent => (
+                <span key={agent.name}>
+                  <input type="checkbox" checked={members.includes(agent.name)} onChange={e => setMembers(value => e.target.checked ? [...value, agent.name] : value.filter(item => item !== agent.name))} />
+                  {" "}{agent.display_name || agent.name}
+                </span>
+              ))}
+            </label>
+          )}
+          <footer className="workflow-editor-actions">
+            <Button variant="ghost" type="button" onClick={onClose}>Cancel</Button>
+            <Button variant="primary" type="submit" disabled={busy || !name.trim() || (needsMembers && !members.length)}>{busy ? "Creating…" : "Create"}</Button>
+          </footer>
+        </form>
+      </section>
+    </div>
+  );
+}
