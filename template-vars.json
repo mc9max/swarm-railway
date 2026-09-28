@@ -1,0 +1,87 @@
+{
+  "SWARM_DEMO": {
+    "defaultValue": "1",
+    "description": "Set to 1 for deterministic mock replies with a seeded #general thread (no provider keys needed). Set to 0 once you have added a real provider key.",
+    "isOptional": true
+  },
+  "SWARM_AGENT_MODEL": {
+    "defaultValue": "openai/gpt-oss-120b",
+    "description": "Model override applied to every agent, e.g. openai/gpt-oss-120b (Groq) or a model slug from your provider.",
+    "isOptional": true
+  },
+  "GROQ_API_KEY": {
+    "defaultValue": "${{secret(32)}}",
+    "description": "Groq API key so bots can respond (free tier at console.groq.com). Replace the placeholder with your key, or leave and manage keys in the UI under Command Center \u2192 AI providers.",
+    "isOptional": true
+  },
+  "OPENROUTER_API_KEY": {
+    "defaultValue": "${{secret(32)}}",
+    "description": "OpenRouter key used as fallback provider if Groq fails or is unset. Manageable in the UI as well.",
+    "isOptional": true
+  },
+  "SWARM_SECRET": {
+    "defaultValue": "${{secret(32)}}",
+    "description": "Secret used for signing sessions. Auto-generated placeholder; each install gets a unique value.",
+    "isOptional": true
+  },
+  "SWARM_BROWSER": {
+    "defaultValue": "1",
+    "description": "1 enables Playwright browser-use tools for bots; set 0 to disable.",
+    "isOptional": true
+  },
+  "SWARM_SYSTEM": {
+    "defaultValue": "1",
+    "description": "1 lets bots run tools on the host (system_run/read/write) bound to SWARM_SYSTEM_ROOT; set 0 to disable on untrusted networks.",
+    "isOptional": true
+  },
+  "SWARM_OPENAI_COMPAT_BASE_URL": {
+    "defaultValue": "",
+    "description": "Optional. Base URL of your own OpenAI-compatible server (Ollama, LM Studio, vLLM), e.g. http://ollama.railway.internal:11434/v1. Leave empty if not using a custom provider (the Custom provider stays hidden).",
+    "isOptional": true
+  },
+  "SWARM_OPENAI_COMPAT_API_KEY": {
+    "defaultValue": "${{secret(16)}}",
+    "description": "Key for the custom OpenAI-compatible endpoint; blank works for keyless servers.",
+    "isOptional": true
+  },
+  "EXA_API_KEY": {
+    "defaultValue": "${{secret(32)}}",
+    "description": "Exa API key for web research tools (Computer \u2192 Apps). Optional.",
+    "isOptional": true
+  },
+  "TAVILY_API_KEY": {
+    "defaultValue": "${{secret(32)}}",
+    "description": "Tavily API key for web research tools (Computer \u2192 Apps). Optional.",
+    "isOptional": true
+  },
+  "FIRECRAWL_API_KEY": {
+    "defaultValue": "${{secret(32)}}",
+    "description": "Firecrawl API key for web crawl tools (Computer \u2192 Apps). Optional.",
+    "isOptional": true
+  },
+  "COMPOSIO_API_KEY": {
+    "defaultValue": "${{secret(32)}}",
+    "description": "Composio key for app integrations (Gmail, Slack, GitHub, Notion, 1000+ apps). Optional.",
+    "isOptional": true
+  },
+  "COMPOSIO_USER_ID": {
+    "defaultValue": "swarm-workspace",
+    "description": "Shared Composio user_id so every bot sees the same connected accounts.",
+    "isOptional": true
+  },
+  "LANGFUSE_PUBLIC_KEY": {
+    "defaultValue": "${{secret(32)}}",
+    "description": "Langfuse public key for LLM observability. Optional.",
+    "isOptional": true
+  },
+  "LANGFUSE_SECRET_KEY": {
+    "defaultValue": "${{secret(32)}}",
+    "description": "Langfuse secret key for LLM observability. Optional.",
+    "isOptional": true
+  },
+  "LANGFUSE_HOST": {
+    "defaultValue": "https://cloud.langfuse.com",
+    "description": "Langfuse host URL if you use observability. Optional.",
+    "isOptional": true
+  }
+}
