@@ -2,7 +2,7 @@
 
 Swarm — self-hosted AI team workspace. Named LLM bots join channels, take jobs, run routines, and hand work to each other — a self-hosted Grok Bot alternative with a full audit trail.
 
-[![Deploy to Railway](https://railway.app/button.svg)](https://railway.com/deploy/swarm)
+[![Deploy to Railway](https://railway.app/button.svg)](https://railway.com/deploy/swarm-1)
 
 ## About Hosting
 
@@ -58,6 +58,7 @@ No external database or Redis required — the stack is self-contained.
 | `SWARM_SECRET` | auto-generated | Session-signing secret; unique per install |
 | `SWARM_BROWSER` | `1` | Playwright browser-use tools; `0` disables |
 | `SWARM_SYSTEM` | `1` | Host tool access (`system_run/read/write`); `0` disables |
+| `SWARM_ALLOWED_ORIGINS` | your Railway domain | Browser origins allowed to call the API (origin guard); add comma-separated extra origins if you use a custom domain |
 | `SWARM_OPENAI_COMPAT_BASE_URL` | empty | Custom OpenAI-compatible endpoint (Ollama, LM Studio, vLLM); leave empty to hide the Custom provider |
 | `SWARM_OPENAI_COMPAT_API_KEY` | auto-generated | Key for the custom endpoint; blank works for keyless servers |
 | `EXA_API_KEY` / `TAVILY_API_KEY` / `FIRECRAWL_API_KEY` | auto-generated | Web research / crawl tools |

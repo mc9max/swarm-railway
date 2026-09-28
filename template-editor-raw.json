@@ -66,5 +66,9 @@
   "LANGFUSE_HOST": {
     "value": "https://cloud.langfuse.com",
     "description": "Langfuse host URL if you use observability. Optional."
+  },
+  "SWARM_ALLOWED_ORIGINS": {
+    "value": "https://${{RAILWAY_PUBLIC_DOMAIN}}",
+    "description": "Browser origins allowed to call the API (origin guard). Defaults to https:// plus your Railway public domain so the UI works on first install. Add more origins comma-separated (scheme://host) if you use a custom domain."
   }
 }
